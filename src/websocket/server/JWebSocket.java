@@ -14,24 +14,24 @@ import java.util.regex.Pattern;
 import javax.xml.bind.DatatypeConverter;
 
 public abstract class JWebSocket {
-	
+
 	private Socket client;
 	private ServerSocket server;
-	
+
 	protected abstract void onServerStarted(ServerSocket server);
-	
-	protected abstract void client_connected();
-	
+
+	protected abstract void client_connected(Socket client);
+
 	protected abstract void client_disconnected();
-	
+
 	protected abstract void interpret_client_text_message(String decoded_data);
 
 	protected abstract void interpret_client_binary_message(byte[] decoded_data);
-	
+
 	protected Socket getClient() {
 		return this.client;
 	}
-	
+
 	protected void send_text_message_to_client(String text_answer) {
 		if (client == null) {
 			// TODO: return some kind of error
@@ -77,21 +77,23 @@ public abstract class JWebSocket {
 		}
 	}
 
-	public void start() {
+	public void start(int port) {
 		try {
-			int port = 32152;
 			this.server = new ServerSocket(port);
 
 			this.onServerStarted(this.server);
 			this.client = this.server.accept();
 
-			this.handshake();
+			if (!this.handshake()) {
+				this.stop();
+				return;
+			}
 
-			client_connected();
-			
+			client_connected(client);
+
 			InputStream in = this.client.getInputStream();
 			OutputStream out;
-			
+
 			while (!this.client.isClosed()) {
 				in = this.client.getInputStream();
 				if (in.available() == 0)
@@ -158,8 +160,10 @@ public abstract class JWebSocket {
 				 * %xB-F are reserved for further control frames
 				 */
 				String opcode_bits = sframe_bits.substring(4);
-				byte[] response_frame;
+
 				switch (opcode_bits) {
+				case "0000": // continuous message
+					break;
 				case "0001": // text message
 					String text_decoded_data = new String(decoded_data);
 
@@ -194,7 +198,7 @@ public abstract class JWebSocket {
 			this.stop();
 		}
 	}
-	
+
 	public void stop() {
 		try {
 			this.client.close();
@@ -203,8 +207,8 @@ public abstract class JWebSocket {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
 		}
-	} 
-	
+	}
+
 	private String random_bit_mask(int leng) {
 		double rand = 0;
 		String bit;
@@ -222,17 +226,17 @@ public abstract class JWebSocket {
 
 		return sb.toString();
 	}
-	
+
 	private boolean handshake() {
 		try {
 			InputStream in = client.getInputStream();
 			BufferedInputStream bis = new BufferedInputStream(in);
 			byte[] read = new byte[in.available()];
-				
+
 			if (bis.read(read) == -1) {
 				return false;
 			}
-		
+
 			String data = new String(read, "UTF-8");
 			Matcher get_matcher = Pattern.compile("^GET").matcher(data);
 			if (get_matcher.find()) {
@@ -240,8 +244,8 @@ public abstract class JWebSocket {
 				key_matcher.find();
 				byte[] response = ("HTTP/1.1 101 Switching Protocols\r\n" + "Connection: Upgrade\r\n"
 						+ "Upgrade: websocket\r\n" + "Sec-WebSocket-Accept: "
-						+ DatatypeConverter.printBase64Binary(MessageDigest.getInstance("SHA-1")
-								.digest((key_matcher.group(1) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").getBytes("UTF-8")))
+						+ DatatypeConverter.printBase64Binary(MessageDigest.getInstance("SHA-1").digest(
+								(key_matcher.group(1) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").getBytes("UTF-8")))
 						+ "\r\n\r\n").getBytes("UTF-8");
 				OutputStream out = client.getOutputStream();
 				out.write(response, 0, response.length);
@@ -258,7 +262,7 @@ public abstract class JWebSocket {
 		}
 
 	}
-	
+
 	private String get_binary(int arg0) {
 		String bits = Integer.toBinaryString(arg0);
 		int size = bits.length();
@@ -385,5 +389,4 @@ public abstract class JWebSocket {
 		return decoded;
 	}
 
-	
 }
