@@ -13,26 +13,86 @@ import java.util.regex.Pattern;
 
 import javax.xml.bind.DatatypeConverter;
 
+/**
+ * This is a simple implementation of RFC6455 - WebSockets.
+ * The main goal is provide a class that communicate with browsers, with no need to run it
+ * in a App Server/Container.
+ * This is abstract because it can identify a new WS connection, send and receive image as server,
+ * but you can implement your own subprotocol. To do that, follow the following steps:
+ * 
+ * 1 - Extend you class to JWebSocket
+ * 
+ * 2 - Implement interpretClientTextMessage and interpretClientBinaryMessage (others methods are optional)
+ * 
+ * 3 - Send client messages by using sendTextMessage and send_binary_message_to_client
+ * 
+ * @author: Mathias de Souza Goulart
+ * @date: 2019-04-16 - First version
+ * @version: 0.1 - Just a part of the protocol is implemented
+ *
+ */
 public abstract class JWebSocket {
-
+	
+	public static final String CONTINUOUS_MSG_OPCODE = "0000", TEXT_OPCODE = "0001",
+			BINARY_OPCODE = "0010", PING_OPCODE = "1001", PONG_OPCODE = "1010",
+			CLOSE_CONNECTION_OPCODE = "1000";
+	protected static final int PING_NOT_SENT_TOLERANCE = 8;
+	
+	private byte[] pingContent;
+	private int pingNotSent, pingPckgSize;
+	private long beginPingCount, pingInterval;
+	private boolean keepPinging;
+	
 	private Socket client;
 	private ServerSocket server;
 
 	protected abstract void onServerStarted(ServerSocket server);
 
-	protected abstract void client_connected(Socket client);
+	protected abstract void clientConnected(Socket client);
 
-	protected abstract void client_disconnected();
+	protected abstract void clientDisconnected();
 
-	protected abstract void interpret_client_text_message(String decoded_data);
+	protected abstract void interpretClientTextMessage(String decoded_data);
 
-	protected abstract void interpret_client_binary_message(byte[] decoded_data);
-
+	protected abstract void interpretClientBinaryMessage(byte[] decoded_data);
+	
+	public JWebSocket() {
+		this.keepPinging = true;
+		this.pingInterval = 5000;
+		this.pingPckgSize = 8;
+		this.beginPingCount = System.currentTimeMillis();
+		this.pingNotSent = 0;
+	}
+	
+	public JWebSocket(boolean keepPinging) {
+		this.keepPinging = keepPinging;
+		this.pingInterval = 5000;
+		this.pingPckgSize = 8;
+		this.beginPingCount = System.currentTimeMillis();
+		this.pingNotSent = 0;
+	}
+	
+	public JWebSocket(boolean keepPinging, long pingInterval) {
+		this.keepPinging = keepPinging;
+		this.pingInterval = pingInterval;
+		this.pingPckgSize = 8;
+		this.beginPingCount = System.currentTimeMillis();
+		this.pingNotSent = 0;
+	}
+	
+	public JWebSocket(boolean keepPinging, long pingInterval, int packageSize) {
+		this.keepPinging = keepPinging;
+		this.pingInterval = pingInterval;
+		this.pingPckgSize = packageSize;
+		this.beginPingCount = System.currentTimeMillis();
+		this.pingNotSent = 0;
+	}
+	
 	protected Socket getClient() {
 		return this.client;
 	}
 
-	protected void send_text_message_to_client(String text_answer) {
+	protected void sendTextMessage(String text_answer) {
 		if (client == null) {
 			// TODO: return some kind of error
 			return;
@@ -45,7 +105,7 @@ public abstract class JWebSocket {
 
 		try {
 			byte[] text_answer_bytes = text_answer.getBytes("UTF-8");
-			byte[] response_frame = create_response_frame(text_answer_bytes);
+			byte[] response_frame = createResponseFrame(text_answer_bytes, TEXT_OPCODE);
 			OutputStream out = client.getOutputStream();
 
 			out.write(response_frame);
@@ -55,7 +115,7 @@ public abstract class JWebSocket {
 		}
 	}
 
-	protected void send_binary_message_to_client(byte[] binary_answer_bytes) {
+	protected void sendBinaryMessage(byte[] binary_answer_bytes) {
 		if (client == null) {
 			// TODO: return some kind of error
 			return;
@@ -67,7 +127,7 @@ public abstract class JWebSocket {
 		}
 
 		try {
-			byte[] response_frame = create_response_frame(binary_answer_bytes);
+			byte[] response_frame = createResponseFrame(binary_answer_bytes, BINARY_OPCODE);
 			OutputStream out = client.getOutputStream();
 
 			out.write(response_frame);
@@ -76,7 +136,59 @@ public abstract class JWebSocket {
 			ex.printStackTrace();
 		}
 	}
+	
+	/**
+	 * Here you can send a message and specify the type of message for your self.
+	 * For more details see RFC 6455:
+	 * Opcode: The following values are defined.
 
+      *  %x0 denotes a continuation frame
+
+      *  %x1 denotes a text frame
+
+      *  %x2 denotes a binary frame
+
+      *  %x3-7 are reserved for further non-control frames
+
+      *  %x8 denotes a connection close
+
+      *  %x9 denotes a ping
+
+      *  %xA denotes a pong
+
+      *  %xB-F are reserved for further control frames
+	 * @param message_data - the bytes of the message to be sent
+	 * @param opcode - the type of message that is being sent
+	 * @throws IOException - May we get a error when trying to send a message to client
+	 */
+	protected void sendMessage(byte[] message_data, String opcode) throws IOException {
+		if (client == null) {
+			// TODO: return some kind of error
+			return;
+		}
+
+		if (!client.isConnected()) {
+			// TODO: report client isn't connected anymore error
+			return;
+		}
+
+		try {
+			byte[] response_frame = createResponseFrame(message_data, opcode);
+			OutputStream out = client.getOutputStream();
+
+			out.write(response_frame);
+		} catch (IOException ex) {
+			// TODO: report writing error
+			ex.printStackTrace();
+		}
+	}
+	
+	/**
+	 * Start a new WebSocket server and list the given port.
+	 * It will keep alive until it receive a CLOSE_CONNECTION opcode, or
+	 * some error happen.
+	 * @param port
+	 */
 	public void start(int port) {
 		try {
 			this.server = new ServerSocket(port);
@@ -89,15 +201,20 @@ public abstract class JWebSocket {
 				return;
 			}
 
-			client_connected(client);
+			clientConnected(client);
 
 			InputStream in = this.client.getInputStream();
 			OutputStream out;
 
 			while (!this.client.isClosed()) {
 				in = this.client.getInputStream();
-				if (in.available() == 0)
-					continue;
+				if (in.available() == 0) {
+					if (this.shouldPing()) {
+						this.pingClient();
+					} else {
+						continue;						
+					}
+				}
 				BufferedInputStream bis = new BufferedInputStream(in);
 
 				int reader_size = in.available();
@@ -130,7 +247,7 @@ public abstract class JWebSocket {
 
 				byte[] decoded_data = null;
 				if (bFin) {
-					decoded_data = read_data(read);
+					decoded_data = readData(read);
 				} else {
 					// TODO: implement a continuous message (when bFin = False)
 				}
@@ -162,34 +279,45 @@ public abstract class JWebSocket {
 				String opcode_bits = sframe_bits.substring(4);
 
 				switch (opcode_bits) {
-				case "0000": // continuous message
+				case CONTINUOUS_MSG_OPCODE:
 					break;
-				case "0001": // text message
+				case TEXT_OPCODE:
 					String text_decoded_data = new String(decoded_data);
 
-					// internal protocol
-					interpret_client_text_message(text_decoded_data);
+					// subprotocol
+					interpretClientTextMessage(text_decoded_data);
 
 					break;
-				case "0010": // binary message
+				case BINARY_OPCODE:
 
-					// internal protocol
-					interpret_client_binary_message(decoded_data);
+					// subprotocol
+					interpretClientBinaryMessage(decoded_data);
 
 					break;
-				case "1000": // close connection
+				case CLOSE_CONNECTION_OPCODE:
 					this.stop();
 					break;
-				case "1001": // ping
-					byte pong_byte = (byte) Integer.parseUnsignedInt("10001010");
-					out = this.client.getOutputStream();
-					out.write(pong_byte);
+				case PING_OPCODE:
+					this.sendMessage(decoded_data, PONG_OPCODE);
+					break;
+				case PONG_OPCODE:
+					if (this.pingContent != null) {
+						String sPingContent = new String(this.pingContent, "UTF-8");
+						String sPongContent = new String(decoded_data, "UTF-8");
+						if(!sPingContent.equals(sPongContent)) {
+							if (this.pingNotSent < this.PING_NOT_SENT_TOLERANCE) {
+								this.pingNotSent++;
+							} else {
+								this.stop();
+							}
+						}
+					}
 					break;
 				}
 
 			}
 
-			client_disconnected();
+			clientDisconnected();
 
 		} catch (Exception e) {
 			// TODO Auto-generated catch block
@@ -198,8 +326,24 @@ public abstract class JWebSocket {
 			this.stop();
 		}
 	}
+	
+	public boolean sendStopSignal() throws Exception {
+		if (getClient() != null ? !getClient().isConnected() : false)
+			throw new Exception("Client is not connected yet!");
 
-	public void stop() {
+		if (getClient() != null ? getClient().isClosed() : false)
+			throw new Exception("Trying to close connection with client when it is already closed!");
+		
+		// indicates that an endpoint is "going away", such as a server
+	    //  going down or a browser having navigated away from a page.
+		this.sendMessage("1001".getBytes("UTF-8"), CLOSE_CONNECTION_OPCODE);
+
+		this.client.close();
+		this.server.close();
+		return true;
+	}
+	
+	protected void stop() {
 		try {
 			this.client.close();
 			this.server.close();
@@ -209,7 +353,7 @@ public abstract class JWebSocket {
 		}
 	}
 
-	private String random_bit_mask(int leng) {
+	private String randomBitMask(int leng) {
 		double rand = 0;
 		String bit;
 
@@ -272,16 +416,16 @@ public abstract class JWebSocket {
 		return bits;
 	}
 
-	private byte[] create_response_frame(byte[] data_bytes) {
+	private byte[] createResponseFrame(byte[] data_bytes, String opcode) {
 		try {
 
-			boolean use_mask = true;
+			boolean use_mask = false; // server MUST NOT mask its frames
 
 			String frame_header = "";
 
-			String fin = "1", rsv1 = "0", rsv2 = "0", rsv3 = "0", text_opcode = "0001";
+			String fin = "1", rsv1 = "0", rsv2 = "0", rsv3 = "0";
 
-			frame_header = frame_header.concat(fin).concat(rsv1).concat(rsv2).concat(rsv3).concat(text_opcode);
+			frame_header = frame_header.concat(fin).concat(rsv1).concat(rsv2).concat(rsv3).concat(opcode);
 
 			if (use_mask)
 				frame_header = frame_header.concat("1");
@@ -311,7 +455,7 @@ public abstract class JWebSocket {
 			byte[] mask_bytes = null;
 			if (use_mask) {
 				int mask_size = 32;
-				String mask = random_bit_mask(mask_size);
+				String mask = randomBitMask(mask_size);
 				frame_header = frame_header.concat(mask);
 				mask_bytes = new byte[mask_size / 8];
 				for (int i = 0; i < mask_size; i += 8) {
@@ -342,7 +486,7 @@ public abstract class JWebSocket {
 		}
 	}
 
-	private byte[] read_data(byte[] data) {
+	private byte[] readData(byte[] data) {
 
 		/*
 		 * If the second byte minus 128 is between 0 and 125, this is the length of the
@@ -387,6 +531,55 @@ public abstract class JWebSocket {
 		}
 
 		return decoded;
+	}
+	
+	public void setKeepPinging(boolean keepPinging) {
+		this.keepPinging = keepPinging;
+	}
+	
+	public void pingClient() throws Exception {
+		if (pingContent != null) {
+			throw new Exception("Ping without answer still waiting");
+		}
+		
+		byte[] pingPckg = this.getPingPackage(this.pingPckgSize);
+		
+		// send the ping frame
+		this.sendMessage(pingPckg, PING_OPCODE);
+		
+		// keep the ping information to prevent a new ping
+		this.beginPingCount = System.currentTimeMillis();
+		
+		// keep the ping content to validate later
+		this.pingContent = pingPckg;
+	}
+	
+	private boolean shouldPing() {
+		return this.keepPinging ? 
+				System.currentTimeMillis() - this.beginPingCount >= this.pingInterval : 
+					false;
+	}
+	
+	private byte randomByte() {
+		String oct = "";
+		for(int i = 0; i < 8; i++) {
+			String bit = (Math.random() * 10) > 5 ? "1" : "0";
+			oct = oct.concat(bit);
+		}
+		return Byte.parseByte(oct);
+	}
+	
+	protected byte[] getPingPackage(int size) {
+		// maximum ping size is 125
+		size = size > 125 ? 125 : size;
+		
+		// generate random content for ping
+		byte[] ping_bytes = new byte[size];
+		for(int i = 0; i < size; i++) {
+			ping_bytes[i] = randomByte();
+		}
+		
+		return ping_bytes;
 	}
 
 }
